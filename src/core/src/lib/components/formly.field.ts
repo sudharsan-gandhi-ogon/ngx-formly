@@ -32,9 +32,10 @@ import {
 } from '../utils';
 import { FieldWrapper } from '../templates/field.wrapper';
 import { FieldType } from '../templates/field.type';
-import { isObservable } from 'rxjs';
-import { debounceTime, distinctUntilChanged, startWith } from 'rxjs/operators';
+import { Subscription, isObservable } from 'rxjs';
+import { debounceTime, distinctUntilChanged, map, startWith } from 'rxjs/operators';
 import { FormlyFieldTemplates } from './formly.template';
+import { VERSION } from '@angular/common';
 
 /**
  * The `<formly-field>` component is used to render the UI widget (layout + type) of a given `field`.
@@ -49,7 +50,7 @@ export class FormlyField implements DoCheck, OnInit, OnChanges, AfterContentInit
   @Input() field: FormlyFieldConfig;
   @ViewChild('container', { read: ViewContainerRef, static: true }) viewContainerRef!: ViewContainerRef;
 
-  private hostObservers: IObserver<any>[] = [];
+  private hostObservers: (IObserver<any> | Subscription)[] = [];
   private componentRefs: (ComponentRef<FieldType> | EmbeddedViewRef<FieldType>)[] = [];
   private hooksObservers: Function[] = [];
   private detectFieldBuild = false;
@@ -239,14 +240,25 @@ export class FormlyField implements DoCheck, OnInit, OnChanges, AfterContentInit
           this.elementRef && this.renderer.setAttribute(this.elementRef.nativeElement, 'class', currentValue);
         }
       }),
-      ...['touched', 'pristine', 'status'].map((prop) =>
-        observe<string>(
-          this.field,
-          ['formControl', prop],
-          ({ firstChange }) => !firstChange && markFieldForCheck(this.field),
-        ),
-      ),
     ];
+
+    const isSignalRequired = +VERSION.major >= 18 && +VERSION.minor >= 1;
+    if (!isSignalRequired) {
+      ['touched', 'pristine', 'status'].forEach((prop) =>
+        this.hostObservers.push(
+          observe<string>(
+            this.field,
+            ['formControl', prop],
+            ({ firstChange }) => !firstChange && markFieldForCheck(this.field),
+          ),
+        ),
+      );
+    } else if (this.field.formControl) {
+      const statusChanges = this.field.formControl.statusChanges
+        .pipe(distinctUntilChanged())
+        .subscribe(() => markFieldForCheck(this.field));
+      this.hostObservers.push(statusChanges);
+    }
   }
 
   private resetRefs(field: FormlyFieldConfigCache) {
@@ -312,6 +324,14 @@ export class FormlyField implements DoCheck, OnInit, OnChanges, AfterContentInit
     if (field.formControl && !field.fieldGroup) {
       const control = field.formControl;
       let valueChanges = control.valueChanges.pipe(
+        map((value) => {
+          field.parsers?.map((parserFn) => (value = (parserFn as any)(value, field)));
+          if (!Object.is(value, field.formControl.value)) {
+            field.formControl.setValue(value);
+          }
+
+          return value;
+        }),
         distinctUntilChanged((x, y) => {
           if (x !== y || Array.isArray(x) || isObject(x)) {
             return false;
@@ -334,12 +354,6 @@ export class FormlyField implements DoCheck, OnInit, OnChanges, AfterContentInit
         // workaround for https://github.com/angular/angular/issues/13792
         if (control._fields?.length > 1 && control instanceof FormControl) {
           control.patchValue(value, { emitEvent: false, onlySelf: true });
-        }
-
-        field.parsers?.forEach((parserFn) => (value = parserFn(value)));
-        if (value !== field.formControl.value) {
-          field.formControl.setValue(value);
-          return;
         }
 
         if (hasKey(field)) {

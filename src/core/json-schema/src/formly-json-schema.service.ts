@@ -55,6 +55,23 @@ function isConst(schema: JSONSchema7Definition) {
   return typeof schema === 'object' && (schema.hasOwnProperty('const') || (schema.enum && schema.enum.length === 1));
 }
 
+function toNumber(value: string | number | null) {
+  if (value === '' || value === undefined) {
+    return undefined;
+  }
+
+  if (value === null) {
+    return null;
+  }
+
+  if (typeof value === 'number') {
+    return value;
+  }
+
+  const val = parseFloat(value);
+  return !isNaN(val) ? val : value;
+}
+
 function totalMatchedFields(field: FormlyFieldConfig): number {
   if (!field.fieldGroup) {
     return hasKey(field) && getFieldValue(field) !== undefined ? 1 : 0;
@@ -92,7 +109,7 @@ export class FormlyJsonschema {
     return this._toFieldConfig(schema, { schema, ...(options || {}) });
   }
 
-  private _toFieldConfig(schema: FormlyJSONSchema7, { key, ...options }: IOptions): FormlyFieldConfig {
+  private _toFieldConfig(schema: FormlyJSONSchema7, { key, isOptional, ...options }: IOptions): FormlyFieldConfig {
     schema = this.resolveSchema(schema, options);
     const types = this.guessSchemaType(schema);
 
@@ -119,35 +136,29 @@ export class FormlyJsonschema {
       field.resetOnHide = true;
     }
 
-    if (key && options.strict) {
-      this.addValidator(field, 'type', (c: AbstractControl, f: FormlyFieldConfig) => {
-        const value = getFieldValue(f);
-        if (value != null) {
-          switch (field.type) {
-            case 'string': {
-              return typeof value === 'string';
-            }
-            case 'integer': {
-              return isInteger(value);
-            }
-            case 'number': {
-              return typeof value === 'number';
-            }
-            case 'object': {
-              return isObject(value);
-            }
-            case 'array': {
-              return Array.isArray(value);
-            }
-          }
-        }
-
-        return true;
-      });
-    }
-
     if (options.shareFormControl === false) {
       field.shareFormControl = false;
+    }
+
+    if (field.defaultValue === undefined && types.length === 1 && isOptional === false) {
+      switch (types[0]) {
+        case 'null': {
+          field.defaultValue = null;
+          break;
+        }
+        case 'string': {
+          field.defaultValue = '';
+          break;
+        }
+        case 'object': {
+          field.defaultValue = {};
+          break;
+        }
+        case 'array': {
+          field.defaultValue = schema.minItems > 0 ? Array.from(new Array(schema.minItems)) : [];
+          break;
+        }
+      }
     }
 
     if (options.ignoreDefault) {
@@ -193,7 +204,28 @@ export class FormlyJsonschema {
     switch (field.type) {
       case 'number':
       case 'integer': {
-        field.parsers = [(v: string | number) => (isEmpty(v) ? v : Number(v))];
+        field.parsers = [
+          (v: string | number, f: FormlyFieldConfig) => {
+            v = toNumber(v);
+
+            if (v === null && f) {
+              const input =
+                typeof document !== 'undefined' && f.id
+                  ? document.querySelector<HTMLInputElement>(`#${f.id}`)
+                  : undefined;
+              if (input && !input.validity.badInput) {
+                v = undefined;
+              }
+
+              if (v !== f.formControl.value) {
+                f.formControl.setValue(v, { emitModelToViewChange: false });
+              }
+            }
+
+            return v;
+          },
+        ] as ((value: any, f?: FormlyFieldConfig) => any)[];
+
         if (schema.hasOwnProperty('minimum')) {
           field.props.min = schema.minimum;
         }
@@ -236,16 +268,16 @@ export class FormlyJsonschema {
       }
       case 'string': {
         field.parsers = [
-          (v) => {
+          (v, f: FormlyFieldConfig) => {
             if (types.indexOf('null') !== -1) {
               v = isEmpty(v) ? null : v;
-            } else if (!field.props.required) {
+            } else if (f && !f.props.required) {
               v = v === '' ? undefined : v;
             }
 
             return v;
           },
-        ];
+        ] as ((value: any, f?: FormlyFieldConfig) => any)[];
 
         ['minLength', 'maxLength', 'pattern'].forEach((prop) => {
           if (schema.hasOwnProperty(prop)) {
@@ -265,7 +297,7 @@ export class FormlyJsonschema {
           const f = this._toFieldConfig(<JSONSchema7>schema.properties[property], {
             ...options,
             key: property,
-            isOptional: options.isOptional || !isRequired,
+            isOptional: isOptional || !isRequired,
           });
 
           field.fieldGroup.push(f);
@@ -340,26 +372,22 @@ export class FormlyJsonschema {
       case 'array': {
         if (schema.hasOwnProperty('minItems')) {
           field.props.minItems = schema.minItems;
-          this.addValidator(field, 'minItems', (c: AbstractControl, f: FormlyFieldConfig) => {
-            const value = getFieldValue(f);
+          this.addValidator(field, 'minItems', ({ value }: AbstractControl) => {
             return isEmpty(value) || value.length >= schema.minItems;
           });
-
-          if (!options.isOptional && schema.minItems > 0 && field.defaultValue === undefined) {
+          if (!isOptional && schema.minItems > 0 && field.defaultValue === undefined) {
             field.defaultValue = Array.from(new Array(schema.minItems));
           }
         }
         if (schema.hasOwnProperty('maxItems')) {
           field.props.maxItems = schema.maxItems;
-          this.addValidator(field, 'maxItems', (c: AbstractControl, f: FormlyFieldConfig) => {
-            const value = getFieldValue(f);
+          this.addValidator(field, 'maxItems', ({ value }: AbstractControl) => {
             return isEmpty(value) || value.length <= schema.maxItems;
           });
         }
         if (schema.hasOwnProperty('uniqueItems')) {
           field.props.uniqueItems = schema.uniqueItems;
-          this.addValidator(field, 'uniqueItems', (c: AbstractControl, f: FormlyFieldConfig) => {
-            const value = getFieldValue(f);
+          this.addValidator(field, 'uniqueItems', ({ value }: AbstractControl) => {
             if (isEmpty(value) || !schema.uniqueItems) {
               return true;
             }
@@ -406,14 +434,14 @@ export class FormlyJsonschema {
               // When items is a single schema, the additionalItems keyword is meaningless, and it should not be used.
               const f = this._toFieldConfig(
                 items,
-                isMultiSchema ? { ...options, key: `${root.fieldGroup.length}` } : options,
+                isMultiSchema
+                  ? { ...options, key: `${root.fieldGroup.length}`, isOptional: false }
+                  : { ...options, isOptional: false },
               );
 
               if (isMultiSchema && !hasKey(f)) {
                 f.key = null;
               }
-
-              f.props.required = true;
 
               return f;
             }
@@ -732,10 +760,12 @@ export class FormlyJsonschema {
     }
 
     let field = schema._field;
-    let model = root.model ? clone(root.model) : root.fieldArray ? [] : {};
+    let model = root.model ? root.model : root.fieldArray ? [] : {};
     if (root.model && hasKey(root)) {
       model = { [Array.isArray(root.key) ? root.key.join('.') : root.key]: getFieldValue(root) };
     }
+
+    model = clone(model);
     if (!field) {
       field = schema._field = root.options.build({
         form: Array.isArray(model) ? new FormArray([]) : new FormGroup({}),
@@ -745,7 +775,6 @@ export class FormlyJsonschema {
             resetOnHide: true,
             ignoreDefault: true,
             map: null,
-            strict: true,
           }),
         ],
         model,

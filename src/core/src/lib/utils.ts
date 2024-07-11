@@ -2,7 +2,7 @@ import { FormlyFieldConfig } from './models';
 import { isObservable } from 'rxjs';
 import { AbstractControl } from '@angular/forms';
 import { FormlyFieldConfigCache } from './models';
-import { ChangeDetectorRef, ComponentRef, TemplateRef, Type } from '@angular/core';
+import { ChangeDetectorRef, ComponentRef, NgZone, TemplateRef, Type, ɵNoopNgZone } from '@angular/core';
 
 export function disableTreeValidityCall(form: any, callback: Function) {
   const _updateTreeValidity = form._updateTreeValidity.bind(form);
@@ -362,4 +362,22 @@ export function markFieldForCheck(field: FormlyFieldConfigCache) {
       ref.markForCheck();
     }
   });
+}
+
+export function isNoopNgZone(ngZone: NgZone) {
+  return ngZone instanceof ɵNoopNgZone;
+}
+
+export function isHiddenField(field: FormlyFieldConfig) {
+  const isHidden = (f: FormlyFieldConfig) => f.hide || f.expressions?.hide || f.hideExpression;
+  let setDefaultValue = !field.resetOnHide || !isHidden(field);
+  if (!isHidden(field) && field.resetOnHide) {
+    let parent = field.parent;
+    while (parent && !isHidden(parent)) {
+      parent = parent.parent;
+    }
+    setDefaultValue = !parent || !isHidden(parent);
+  }
+
+  return !setDefaultValue;
 }
